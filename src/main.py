@@ -1,12 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import requests
 import pandas as pd
 from pysyncon import Dataprep, Synth
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
+from functools import lru_cache
+import hashlib
+import json
 
 app = FastAPI(title="Counterfactually API")
 
@@ -18,6 +21,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Cache storage
+cache: Dict[str, tuple[datetime, dict]] = {}
+CACHE_DURATION = timedelta(hours=1)
 
 class SynthControlRequest(BaseModel):
     time_predictors_prior_start: datetime
@@ -33,11 +40,24 @@ class SynthControlRequest(BaseModel):
         'tvl_eth', 'tvl', 'stables_mcap_eth', 'fdv_eth'
     ]
 
+    def cache_key(self) -> str:
+        """Generate a unique cache key for this request"""
+        request_dict = self.dict()
+        # Convert datetime objects to strings
+        request_dict['time_predictors_prior_start'] = self.time_predictors_prior_start.isoformat()
+        request_dict['time_predictors_prior_end'] = self.time_predictors_prior_end.isoformat()
+        request_dict['time_optimize_ssr_start'] = self.time_optimize_ssr_start.isoformat()
+        request_dict['time_optimize_ssr_end'] = self.time_optimize_ssr_end.isoformat()
+        # Sort predictors list for consistent hashing
+        request_dict['predictors'].sort()
+        request_dict['controls_identifier'].sort()
+        # Create a string representation and hash it
+        request_str = json.dumps(request_dict, sort_keys=True)
+        return hashlib.md5(request_str.encode()).hexdigest()
+
 class SynthControlResponse(BaseModel):
     weights: dict
-    treatment_data: List[float]  # Z1 values
-    synthetic_data: List[float]  # synthetic values
-    dates: List[str]  # date range for the data
+    data: List[dict]
 
 def reshape_to_metrics_columns(df):
     df['date'] = pd.to_datetime(df['date'])
@@ -52,9 +72,31 @@ def reshape_to_metrics_columns(df):
 async def health_check():
     return {"status": "healthy"}
 
+def get_cached_response(request: SynthControlRequest) -> Optional[SynthControlResponse]:
+    """Check if there's a valid cached response for this request"""
+    cache_key = request.cache_key()
+    if cache_key in cache:
+        timestamp, response = cache[cache_key]
+        if datetime.now() - timestamp < CACHE_DURATION:
+            return response
+        else:
+            del cache[cache_key]
+    return None
+
+def cache_response(request: SynthControlRequest, response: dict):
+    """Cache the response for this request"""
+    cache_key = request.cache_key()
+    cache[cache_key] = (datetime.now(), response)
+
 @app.post("/synth", response_model=SynthControlResponse)
 async def create_synth_control(request: SynthControlRequest):
     try:
+        # Check cache first
+        cached_response = get_cached_response(request)
+        if cached_response:
+            return cached_response
+
+        # If not in cache, proceed with calculation
         # Fetch data
         url = 'https://api.growthepie.xyz/v1/fundamentals_full.json'
         response = requests.get(url)
@@ -95,30 +137,61 @@ async def create_synth_control(request: SynthControlRequest):
         synth = Synth()
         synth.fit(dataprep)
         
-        # Get weights
-        weights_dict = synth.weights().to_dict()
+        # Get weights and round them to 3 decimal places
+        weights_df = synth.weights()
+        weights_dict = {
+            index: round(float(value), 3) 
+            for index, value in weights_df.items()
+        }
 
         # Calculate plot data
         plot_dates = pd.date_range('2022-01-01', '2024-01-01', freq='D')
         Z0, Z1 = dataprep.make_outcome_mats(plot_dates)
         synthetic = synth._synthetic(Z0)
 
-        return SynthControlResponse(
+        # Create the data array with the new structure
+        data = [
+            {
+                "date": date.strftime('%Y-%m-%d'),
+                "treatment": float(treatment),
+                "synthetic": float(synth)
+            }
+            for date, treatment, synth in zip(plot_dates, Z1, synthetic)
+        ]
+
+        response_data = SynthControlResponse(
             weights=weights_dict,
-            treatment_data=Z1.tolist(),
-            synthetic_data=synthetic.tolist(),
-            dates=[d.strftime('%Y-%m-%d') for d in plot_dates]
+            data=data
         )
+
+        # Cache the response
+        cache_response(request, response_data)
+
+        return response_data
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/cache/clear")
+async def clear_cache():
+    """Endpoint to clear the cache"""
+    cache.clear()
+    return {"message": "Cache cleared"}
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Endpoint to get cache statistics"""
+    return {
+        "size": len(cache),
+        "keys": list(cache.keys())
+    }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=80,
         workers=4,  # Adjust based on your EC2 instance size
         proxy_headers=True,
         forwarded_allow_ips='*'
