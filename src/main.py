@@ -6,8 +6,18 @@ import pandas as pd
 from pysyncon import Dataprep, Synth
 from datetime import datetime
 import numpy as np
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Counterfactually API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class SynthControlRequest(BaseModel):
     time_predictors_prior_start: datetime
@@ -37,6 +47,10 @@ def reshape_to_metrics_columns(df):
         values='value'
     ).reset_index()
     return df_wide.sort_values(['date', 'origin_key'])
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
 @app.post("/synth", response_model=SynthControlResponse)
 async def create_synth_control(request: SynthControlRequest):
@@ -98,3 +112,14 @@ async def create_synth_control(request: SynthControlRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=4,  # Adjust based on your EC2 instance size
+        proxy_headers=True,
+        forwarded_allow_ips='*'
+    )
