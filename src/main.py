@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import requests
 import pandas as pd
@@ -11,7 +11,13 @@ from functools import lru_cache
 import hashlib
 import json
 
-app = FastAPI(title="Counterfactually API")
+app = FastAPI(
+    title="Counterfactually API",
+    description="API for synthetic control analysis",
+    version="1.0.0",
+    docs_url="/docs",  # customize Swagger UI URL (optional)
+    redoc_url="/redoc"  # customize ReDoc URL (optional)
+)
 
 # Add CORS middleware
 app.add_middleware(
@@ -27,18 +33,42 @@ cache: Dict[str, tuple[datetime, dict]] = {}
 CACHE_DURATION = timedelta(hours=1)
 
 class SynthControlRequest(BaseModel):
-    time_predictors_prior_start: datetime
-    time_predictors_prior_end: datetime
-    time_optimize_ssr_start: datetime
-    time_optimize_ssr_end: datetime
-    dependent: str
-    treatment_identifier: str
-    controls_identifier: List[str]
-    predictors: Optional[List[str]] = [
-        'market_cap_eth', 'txcount', 'fees_paid_eth', 
-        'txcosts_median_eth', 'stables_mcap', 'gas_per_second', 
-        'tvl_eth', 'tvl', 'stables_mcap_eth', 'fdv_eth'
-    ]
+    time_predictors_prior_start: datetime = Field(
+        ...,
+        description="Start date for the predictor period used to train the synthetic control model"
+    )
+    time_predictors_prior_end: datetime = Field(
+        ...,
+        description="End date for the predictor period used to train the synthetic control model"
+    )
+    time_optimize_ssr_start: datetime = Field(
+        ...,
+        description="Start date for the optimization period where synthetic control weights are calculated"
+    )
+    time_optimize_ssr_end: datetime = Field(
+        ...,
+        description="End date for the optimization period where synthetic control weights are calculated"
+    )
+    dependent: str = Field(
+        ...,
+        description="The target variable to be predicted (e.g., 'market_cap_eth')"
+    )
+    treatment_identifier: str = Field(
+        ...,
+        description="The identifier for the treated unit (e.g., 'arbitrum')"
+    )
+    controls_identifier: List[str] = Field(
+        ...,
+        description="List of identifiers for the control units (e.g., ['optimism', 'base'])"
+    )
+    predictors: Optional[List[str]] = Field(
+        default=[
+            'market_cap_eth', 'txcount', 'fees_paid_eth', 
+            'txcosts_median_eth', 'stables_mcap', 'gas_per_second', 
+            'tvl_eth', 'tvl', 'stables_mcap_eth', 'fdv_eth'
+        ],
+        description="List of variables used to predict the dependent variable. Defaults to common blockchain metrics"
+    )
 
     def cache_key(self) -> str:
         """Generate a unique cache key for this request"""
@@ -88,8 +118,39 @@ def cache_response(request: SynthControlRequest, response: dict):
     cache_key = request.cache_key()
     cache[cache_key] = (datetime.now(), response)
 
-@app.post("/synth", response_model=SynthControlResponse)
+@app.post("/synth", response_model=SynthControlResponse,
+    summary="Create synthetic control analysis",
+    description="""
+    Performs synthetic control analysis to create a counterfactual prediction.
+    
+    The analysis consists of two main steps:
+    1. Training period: Uses predictor variables to find optimal weights for control units
+    2. Prediction period: Applies these weights to create a synthetic control
+    
+    The response includes both the calculated weights and the resulting time series data.
+    
+    Note: Results are cached for 1 hour to improve performance.
+    """,
+    response_description="Returns the synthetic control weights and time series data"
+)
 async def create_synth_control(request: SynthControlRequest):
+    """
+    Create a synthetic control analysis.
+
+    Parameters:
+    - time_predictors_prior_start: Start date for predictor period
+    - time_predictors_prior_end: End date for predictor period
+    - time_optimize_ssr_start: Start date for optimization period
+    - time_optimize_ssr_end: End date for optimization period
+    - dependent: Dependent variable name
+    - treatment_identifier: Identifier for treatment group
+    - controls_identifier: List of control group identifiers
+    - predictors: Optional list of predictor variables
+
+    Returns:
+    - weights: Dictionary of control weights
+    - data: Time series of treatment and synthetic values
+    """
     try:
         # Check cache first
         cached_response = get_cached_response(request)
