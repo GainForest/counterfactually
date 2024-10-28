@@ -188,11 +188,14 @@ async def cache_stats():
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    
+    port = int(os.getenv("PORT", 80))
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=80,
-        workers=4,  # Adjust based on your EC2 instance size
+        port=port,
+        workers=4,
         proxy_headers=True,
         forwarded_allow_ips='*'
     )
