@@ -206,7 +206,7 @@ async def create_synth_control(request: SynthControlRequest):
         }
 
         # Calculate plot data
-        plot_dates = pd.date_range('2022-01-01', '2024-01-01', freq='D')
+        plot_dates = pd.date_range('2022-01-01', '2024-08-01', freq='D')
         Z0, Z1 = dataprep.make_outcome_mats(plot_dates)
         synthetic = synth._synthetic(Z0)
 
